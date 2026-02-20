@@ -1,64 +1,55 @@
-import { routeAgentRequest } from "agents";
-import { SprintAgent } from "./SprintAgent";
-import type { Env } from "./types";
+import { routeAgentRequest } from 'agents';
+import type { Env } from './types';
+import { SprintAgent } from './SprintAgent';
 
-// Re-export SprintAgent so the Workers runtime can register it as a Durable Object
-export { SprintAgent };
-
-const corsHeaders = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization, Upgrade, Connection",
-};
-
-function withCors(response: Response): Response {
-    const newHeaders = new Headers(response.headers);
-    for (const [key, value] of Object.entries(corsHeaders)) {
-        newHeaders.set(key, value);
-    }
-    return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers: newHeaders,
-    });
+// Helper function to add CORS headers
+function corsHeaders(origin: string = '*') {
+    return {
+        'Access-Control-Allow-Origin': origin,
+        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type, Upgrade, Connection, Sec-WebSocket-Key, Sec-WebSocket-Version',
+        'Access-Control-Max-Age': '86400',
+    };
 }
 
 export default {
     async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-        // Handle CORS preflight
-        if (request.method === "OPTIONS") {
-            return new Response(null, { status: 204, headers: corsHeaders });
-        }
-
         const url = new URL(request.url);
+        const origin = request.headers.get('Origin') || '*';
 
-        // Health check endpoint
-        if (url.pathname === "/health") {
-            return new Response(
-                JSON.stringify({ status: "ok", timestamp: Date.now(), service: "sprint-planner-agent" }),
-                {
-                    status: 200,
-                    headers: { ...corsHeaders, "Content-Type": "application/json" },
-                }
-            );
+        // Handle CORS preflight
+        if (request.method === 'OPTIONS') {
+            return new Response(null, {
+                headers: corsHeaders(origin),
+            });
         }
 
-        // Route all /agents/* paths (and WebSocket upgrades) to the Agent framework.
-        // IMPORTANT: Do NOT wrap WebSocket upgrade responses with CORS headers —
-        // adding headers to a 101 Switching Protocols response breaks the handshake.
-        const isWebSocket = request.headers.get("Upgrade") === "websocket";
-        const agentResponse = await routeAgentRequest(request, env);
-        if (agentResponse) {
-            return isWebSocket ? agentResponse : withCors(agentResponse);
-        }
+        // Route to Agent
+        const response = routeAgentRequest(request, env, ctx);
 
-        // 404 fallback
-        return new Response(
-            JSON.stringify({ error: "Not found", path: url.pathname }),
-            {
-                status: 404,
-                headers: { ...corsHeaders, "Content-Type": "application/json" },
+        if (response) {
+            // Check if this is a WebSocket upgrade (status 101)
+            if (response.status === 101 || request.headers.get('Upgrade') === 'websocket') {
+                // For WebSocket upgrades, return the response as-is
+                // DO NOT add CORS headers or modify the response
+                return response;
             }
-        );
+
+            // For regular HTTP responses, add CORS headers
+            const newResponse = new Response(response.body, response);
+            Object.entries(corsHeaders(origin)).forEach(([key, value]) => {
+                newResponse.headers.set(key, value);
+            });
+            return newResponse;
+        }
+
+        // 404 for unmatched routes
+        return new Response('Not found', {
+            status: 404,
+            headers: corsHeaders(origin),
+        });
     },
 } satisfies ExportedHandler<Env>;
+
+// Export the Durable Object class
+export { SprintAgent };
