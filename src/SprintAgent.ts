@@ -12,7 +12,6 @@ import type {
 } from "./types";
 
 export class SprintAgent extends Agent<Env, SprintState> {
-    // Track all active connections for selective broadcast
     private connections = new Map<string, Connection<ConnectionState>>();
 
     initialState: SprintState = {
@@ -25,8 +24,6 @@ export class SprintAgent extends Agent<Env, SprintState> {
         createdAt: Date.now(),
         lastUpdatedAt: Date.now(),
     };
-
-    // ─── Lifecycle ────────────────────────────────────────────────────────────
 
     async onStart(): Promise<void> {
         if (!this.state.sprintId) {
@@ -56,7 +53,6 @@ export class SprintAgent extends Agent<Env, SprintState> {
         const initMsg: ServerMessage = { type: "init", state: this.state };
         connection.send(JSON.stringify(initMsg));
 
-        // Notify everyone EXCEPT the joining connection (they already got init)
         const joinMsg: ServerMessage = { type: "user_joined", userName, connectedUsers };
         this.broadcastExcept(connection.id, joinMsg);
 
@@ -181,13 +177,6 @@ export class SprintAgent extends Agent<Env, SprintState> {
     }
 
     // ─── SSE stream reader ────────────────────────────────────────────────────
-    //
-    // Workers AI with stream:true returns a ReadableStream of SSE-formatted lines:
-    //   data: {"response":"token"}\n\n
-    //   data: [DONE]\n\n
-    //
-    // We decode the raw bytes, split by newline, and parse each "data:" line.
-    // onChunk is called for every token; the full accumulated string is returned.
 
     private async readSSEStream(
         stream: ReadableStream,
@@ -205,7 +194,6 @@ export class SprintAgent extends Agent<Env, SprintState> {
 
                 sseBuffer += decoder.decode(value, { stream: true });
                 const lines = sseBuffer.split("\n");
-                // The last element may be an incomplete line — keep it in the buffer
                 sseBuffer = lines.pop() ?? "";
 
                 for (const line of lines) {
@@ -262,18 +250,42 @@ export class SprintAgent extends Agent<Env, SprintState> {
             : "";
 
         const systemPrompt =
-            "You are an engineering manager prioritizing a sprint backlog.\n" +
-            "Rules: quick wins (low effort, high impact) = include early; high effort + low impact = defer; blockers = rank higher; vague/huge tasks = split or clarify.\n" +
+            "You are a senior engineering manager with 15 years experience running sprints.\n" +
+            "A junior dev can sort tasks by impact/effort score — that is NOT your job here.\n" +
+            "Your job is to find non-obvious insights a number-sorter would miss:\n" +
+            "- Tasks that SOUND different but solve the same underlying problem (not just identical titles)\n" +
+            "- Hidden blockers: task B will fail or be wasted if task A isn't done first\n" +
+            "- Risk flags: tasks that are underestimated based on their description\n" +
+            "- Scope creep: tasks vague enough that they could explode in effort mid-sprint\n" +
+            "- Assignee overload: if the same person is on too many high-effort tasks\n" +
+            "- Quick wins that will unblock OTHER tasks, not just high value standalone\n" +
+            "Be specific in your rationale — reference the actual task descriptions, not just the numbers.\n" +
             "CRITICAL: Return ONLY raw JSON. No markdown, no code fences, no explanation outside the JSON.";
 
         const userPrompt =
             `Sprint backlog:\n\n${taskList}${constraintsSection}\n\n` +
             "Return ONLY this JSON (no other text):\n" +
-            `{"prioritizedTasks":[{"taskId":"<id>","rank":1,"rationale":"<brief reason under 20 words>","recommendation":"include"}],"summary":"<2 sentences>","totalEstimatedEffort":<number>,"reasoning":"<3 sentences>"}\n\n` +
-            "Requirements: every task must appear, keep rationale SHORT (under 20 words each), valid recommendation values: include|defer|split|clarify";
+            `{
+  "prioritizedTasks":[{"taskId":"<id>","rank":1,"rationale":"<specific insight referencing description, not just numbers>","recommendation":"include|defer|split|clarify"}],
+  "topRecommendations":[
+    "<actionable recommendation 1 — e.g. swap task X and Y because...>",
+    "<actionable recommendation 2>",
+    "<actionable recommendation 3>"
+  ],
+  "risks":[
+    "<specific risk with task name — e.g. Redesign dashboard is likely underestimated, UI work always expands>",
+    "<specific risk 2>"
+  ],
+  "assigneeFlags":[
+    "<e.g. Alice has 3 high-effort tasks — consider redistributing X to Bob>"
+  ],
+  "summary":"<1 sentence — the single most important thing the team should know going into this sprint>",
+  "totalEstimatedEffort":<number>,
+  "warnings":["<only non-obvious duplicates — tasks that solve the same problem even if named differently>"],
+  "dependencies":[{"taskId":"<id>","dependsOn":"<id>","reason":"<why this ordering matters>"}]
+}\n\n` +
+            "Requirements: every task must appear in prioritizedTasks, rationale must reference the actual description not just scores.";
 
-        // Use stream:false for plan generation — we need complete JSON, not a stream.
-        // Streaming JSON is unreliable; any truncation makes it unparseable.
         const aiResponse = await (this.env.AI.run as Function)(
             "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
             {
@@ -286,13 +298,10 @@ export class SprintAgent extends Agent<Env, SprintState> {
             }
         ) as { response: string };
 
-        // Workers AI may return the response as an object or as a string depending on
-        // the runtime version — handle both defensively.
         const rawResponse = aiResponse.response ?? aiResponse;
         const accumulated = (typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse)).trim();
         console.log(`[SprintAgent] Plan raw response (${accumulated.length} chars):`, accumulated.slice(0, 300));
 
-        // Broadcast the full response as a single chunk for client display
         if (accumulated) {
             this.broadcast(JSON.stringify({ type: "plan_stream_chunk", chunk: accumulated }));
         }
@@ -304,9 +313,13 @@ export class SprintAgent extends Agent<Env, SprintState> {
 
         let parsedPlan: {
             prioritizedTasks: PrioritizedTask[];
+            topRecommendations?: string[];
+            risks?: string[];
+            assigneeFlags?: string[];
             summary: string;
             totalEstimatedEffort: number;
-            reasoning: string;
+            warnings?: string[];
+            dependencies?: { taskId: string; dependsOn: string; reason: string }[];
         };
 
         try {
@@ -322,9 +335,13 @@ export class SprintAgent extends Agent<Env, SprintState> {
 
         const plan: GeneratedPlan = {
             prioritizedTasks: parsedPlan.prioritizedTasks,
+            topRecommendations: parsedPlan.topRecommendations ?? [],
+            risks: parsedPlan.risks ?? [],
+            assigneeFlags: parsedPlan.assigneeFlags ?? [],
             summary: parsedPlan.summary,
             totalEstimatedEffort: parsedPlan.totalEstimatedEffort,
-            reasoning: parsedPlan.reasoning,
+            warnings: parsedPlan.warnings ?? [],
+            dependencies: parsedPlan.dependencies ?? [],
             generatedAt: Date.now(),
             generatedBy: data.userName,
         };
@@ -367,7 +384,8 @@ export class SprintAgent extends Agent<Env, SprintState> {
         const planContext =
             `Sprint: "${this.state.sprintName}"\n\nTasks:\n${taskSummary}\n\n` +
             `Plan summary: ${plan.summary}\n` +
-            `Reasoning: ${plan.reasoning}\n` +
+            `Top recommendations:\n${plan.topRecommendations?.join("\n") ?? "none"}\n` +
+            `Risks:\n${plan.risks?.join("\n") ?? "none"}\n` +
             `Ranked order:\n${[...plan.prioritizedTasks]
                 .sort((a, b) => a.rank - b.rank)
                 .map((pt) => {
@@ -420,7 +438,6 @@ export class SprintAgent extends Agent<Env, SprintState> {
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
 
-    /** Broadcast to all connections except the one specified. */
     private broadcastExcept(excludeConnectionId: string, message: object): void {
         const payload = JSON.stringify(message);
         for (const [id, conn] of this.connections) {
