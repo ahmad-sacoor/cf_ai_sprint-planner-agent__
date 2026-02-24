@@ -25,7 +25,7 @@ export default {
         }
 
         // Route to Agent
-        const response = routeAgentRequest(request, env, ctx);
+        const response = await routeAgentRequest(request, env);
 
         if (response) {
             // Check if this is a WebSocket upgrade (status 101)
