@@ -60,8 +60,7 @@ function App() {
 
     function connectWebSocket() {
         if (!userName || !sprintId) { setError('Please enter both fields'); return; }
-        const socket = new WebSocket(`wss://sprint-planning-agent.ahmad-edge-proxy.workers.dev${sprintId}?userName=${encodeURIComponent(userName)}`);
-        socket.onopen = () => { setJoined(true); setError(''); };
+        const socket = new WebSocket(`wss://sprint-planning-agent.ahmad-edge-proxy.workers.dev/agents/sprint-agent/${sprintId}?userName=${encodeURIComponent(userName)}`);        socket.onopen = () => { setJoined(true); setError(''); };
         socket.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
