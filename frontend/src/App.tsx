@@ -20,6 +20,7 @@ interface SprintState {
     generatedPlan: any | null;
     chatHistory: any[];
     connectedUsers: string[];
+    isGeneratingPlan: boolean;
     createdAt: number;
     lastUpdatedAt: number;
 }
@@ -30,7 +31,6 @@ function resolveTaskIds(text: string, tasks: Task[]): string {
     return resolved;
 }
 
-// Shared section header style
 const sectionLabel: React.CSSProperties = {
     fontSize: '11px',
     fontWeight: 600,
@@ -46,6 +46,7 @@ function App() {
     const [joined, setJoined] = useState(false);
     const [sprintState, setSprintState] = useState<SprintState | null>(null);
     const [error, setError] = useState('');
+    const [notification, setNotification] = useState('');  // ← NEW
 
     const [taskTitle, setTaskTitle] = useState('');
     const [taskDescription, setTaskDescription] = useState('');
@@ -55,10 +56,11 @@ function App() {
     const [taskAssignee, setTaskAssignee] = useState('');
 
     const ws = useRef<WebSocket | null>(null);
+    const notifTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
     function connectWebSocket() {
         if (!userName || !sprintId) { setError('Please enter both fields'); return; }
-        const socket = new WebSocket(`ws://localhost:8787/agents/sprint-agent/${sprintId}?userName=${encodeURIComponent(userName)}`);
+        const socket = new WebSocket(`wss://sprint-planning-agent.ahmad-edge-proxy.workers.dev${sprintId}?userName=${encodeURIComponent(userName)}`);
         socket.onopen = () => { setJoined(true); setError(''); };
         socket.onmessage = (event) => {
             try {
@@ -70,6 +72,11 @@ function App() {
                     case 'user_left': setSprintState(prev => prev ? { ...prev, connectedUsers: data.connectedUsers } : null); break;
                     case 'error': setError(data.message); break;
                     case 'plan_stream_done': setSprintState(prev => prev ? { ...prev, generatedPlan: data.plan } : null); break;
+                    case 'notify':   // ← NEW
+                        setNotification(data.message);
+                        if (notifTimer.current) clearTimeout(notifTimer.current);
+                        notifTimer.current = setTimeout(() => setNotification(''), 6000);
+                        break;
                 }
             } catch (err) { console.error(err); }
         };
@@ -96,7 +103,12 @@ function App() {
 
     function handleDeleteTask(taskId: string) { sendMessage({ type: 'delete_task', taskId }); }
 
-    useEffect(() => { return () => { ws.current?.close(); }; }, []);
+    useEffect(() => {
+        return () => {
+            ws.current?.close();
+            if (notifTimer.current) clearTimeout(notifTimer.current);
+        };
+    }, []);
 
     // ─── Login ────────────────────────────────────────────────────────────────
     if (!joined) {
@@ -149,6 +161,7 @@ function App() {
     const tasks = sprintState?.tasks || [];
     const plan = sprintState?.generatedPlan;
     const connectedUsers = sprintState?.connectedUsers || [];
+    const isGenerating = sprintState?.isGeneratingPlan ?? false;
 
     const includedTasks = plan
         ? [...plan.prioritizedTasks]
@@ -183,8 +196,21 @@ function App() {
             <AnimatePresence>
                 {error && (
                     <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }}
-                                style={{ padding: '10px 14px', marginBottom: '18px', background: 'rgba(255,59,48,0.06)', border: '1px solid rgba(255,59,48,0.15)', borderRadius: '10px', color: 'var(--red)', fontSize: '13px' }}>
+                                style={{ padding: '10px 14px', marginBottom: '14px', background: 'rgba(255,59,48,0.06)', border: '1px solid rgba(255,59,48,0.15)', borderRadius: '10px', color: 'var(--red)', fontSize: '13px' }}>
                         {error}
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            {/* Notification banner — shown to all users when someone triggers generation */}
+            <AnimatePresence>
+                {notification && (
+                    <motion.div
+                        initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }}
+                        style={{ padding: '10px 14px', marginBottom: '14px', background: 'rgba(0,113,227,0.06)', border: '1px solid rgba(0,113,227,0.15)', borderRadius: '10px', color: 'var(--blue)', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                        {/* Tiny spinner inline */}
+                        <span style={{ width: '12px', height: '12px', borderRadius: '50%', border: '2px solid rgba(0,113,227,0.2)', borderTopColor: 'var(--blue)', display: 'inline-block', animation: 'spin 0.7s linear infinite', flexShrink: 0 }} />
+                        {notification}
                     </motion.div>
                 )}
             </AnimatePresence>
@@ -235,10 +261,18 @@ function App() {
                         <p style={{ fontSize: '13px', color: 'var(--text-tertiary)', marginBottom: '14px', lineHeight: '1.5' }}>
                             Analyze dependencies, risks, and workload distribution across your backlog.
                         </p>
-                        <button onClick={handleGeneratePlan} disabled={tasks.length === 0}
-                                className={`apple-button ${tasks.length > 0 ? 'apple-button-primary' : 'apple-button-secondary'}`}
-                                style={{ width: '100%' }}>
-                            {tasks.length > 0 ? 'Generate Plan' : 'Add tasks first'}
+                        <button
+                            onClick={handleGeneratePlan}
+                            disabled={tasks.length === 0 || isGenerating}
+                            className={`apple-button ${tasks.length > 0 && !isGenerating ? 'apple-button-primary' : 'apple-button-secondary'}`}
+                            style={{ width: '100%', gap: '8px' }}
+                        >
+                            {isGenerating ? (
+                                <>
+                                    <span style={{ width: '12px', height: '12px', borderRadius: '50%', border: '2px solid rgba(255,255,255,0.3)', borderTopColor: 'rgba(255,255,255,0.8)', display: 'inline-block', animation: 'spin 0.7s linear infinite' }} />
+                                    Generating…
+                                </>
+                            ) : tasks.length > 0 ? 'Generate Plan' : 'Add tasks first'}
                         </button>
                     </motion.div>
                 </div>
@@ -277,10 +311,8 @@ function App() {
                                             </div>
                                             <p style={{ fontSize: '11px', color: 'var(--text-tertiary)', marginTop: '6px' }}>{task.assignee}</p>
                                             <button onClick={() => handleDeleteTask(task.id)}
-                                                    style={{ position: 'absolute', top: '10px', right: '10px', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-tertiary)', fontSize: '14px', padding: '2px', lineHeight: 1 }}
-                                                    title="Delete">
-                                                ×
-                                            </button>
+                                                    style={{ position: 'absolute', top: '10px', right: '10px', background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-tertiary)', fontSize: '16px', lineHeight: 1, padding: '2px 4px' }}
+                                                    title="Delete">×</button>
                                         </motion.div>
                                     ))}
                                 </AnimatePresence>
@@ -298,7 +330,6 @@ function App() {
                         transition={{ duration: 0.3 }}
                         className="glass-card" style={{ padding: '28px 32px' }}
                     >
-                        {/* Plan header */}
                         <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: '20px', flexWrap: 'wrap', gap: '8px' }}>
                             <div>
                                 <p style={sectionLabel}>AI Generated Plan</p>
@@ -319,12 +350,10 @@ function App() {
                             </div>
                         )}
 
-                        {/* Divider */}
                         <div style={{ height: '1px', background: 'var(--border)', marginBottom: '22px' }} />
 
                         {/* Insights grid */}
                         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: '14px', marginBottom: '26px' }}>
-
                             {plan.topRecommendations?.length > 0 && (
                                 <div style={{ padding: '16px', background: 'rgba(52,199,89,0.05)', borderRadius: '10px', border: '1px solid rgba(52,199,89,0.15)' }}>
                                     <p style={{ fontSize: '11px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--green)', marginBottom: '10px' }}>Recommendations</p>
@@ -335,7 +364,6 @@ function App() {
                                     </ul>
                                 </div>
                             )}
-
                             {plan.risks?.length > 0 && (
                                 <div style={{ padding: '16px', background: 'rgba(255,59,48,0.04)', borderRadius: '10px', border: '1px solid rgba(255,59,48,0.12)' }}>
                                     <p style={{ fontSize: '11px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--red)', marginBottom: '10px' }}>Risks</p>
@@ -346,7 +374,6 @@ function App() {
                                     </ul>
                                 </div>
                             )}
-
                             {plan.assigneeFlags?.length > 0 && (
                                 <div style={{ padding: '16px', background: 'rgba(255,149,0,0.04)', borderRadius: '10px', border: '1px solid rgba(255,149,0,0.12)' }}>
                                     <p style={{ fontSize: '11px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--orange)', marginBottom: '10px' }}>Workload</p>
@@ -370,10 +397,10 @@ function App() {
                                     {includedTasks.map(({ task, rationale, rank }: any, i: number) => (
                                         <div key={i} style={{ padding: '14px', background: 'var(--bg-page)', borderRadius: '10px', border: '1px solid var(--border)', display: 'flex', flexDirection: 'column', gap: '6px' }}>
                                             <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-                                                <span style={{ fontSize: '10px', fontWeight: 700, color: 'var(--text-tertiary)', background: 'var(--bg-input)', padding: '2px 7px', borderRadius: '5px', letterSpacing: '0.02em' }}>
+                                                <span style={{ fontSize: '10px', fontWeight: 700, color: 'var(--text-tertiary)', background: 'var(--bg-input)', padding: '2px 7px', borderRadius: '5px' }}>
                                                     #{rank}
                                                 </span>
-                                                <span style={{ fontSize: '13px', fontWeight: 600, color: 'var(--text-primary)' }}>{task?.title ?? 'Unknown'}</span>
+                                                <span style={{ fontSize: '13px', fontWeight: 600 }}>{task?.title ?? 'Unknown'}</span>
                                             </div>
                                             <p style={{ fontSize: '12px', color: 'var(--text-tertiary)', margin: 0, lineHeight: '1.5' }}>{rationale}</p>
                                         </div>
@@ -382,10 +409,9 @@ function App() {
                             </div>
                         )}
 
-                        {/* Warnings + Dependencies side by side if both exist */}
+                        {/* Warnings + Dependencies */}
                         {(plan.warnings?.length > 0 || plan.dependencies?.length > 0) && (
                             <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', gap: '14px' }}>
-
                                 {plan.warnings?.length > 0 && (
                                     <div style={{ padding: '14px 16px', background: 'rgba(255,149,0,0.04)', borderRadius: '10px', border: '1px solid rgba(255,149,0,0.12)' }}>
                                         <p style={{ fontSize: '11px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--orange)', marginBottom: '10px' }}>Warnings</p>
@@ -398,7 +424,6 @@ function App() {
                                         </ul>
                                     </div>
                                 )}
-
                                 {plan.dependencies?.length > 0 && (
                                     <div style={{ padding: '14px 16px', background: 'rgba(142,92,246,0.04)', borderRadius: '10px', border: '1px solid rgba(142,92,246,0.12)' }}>
                                         <p style={{ fontSize: '11px', fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', color: 'var(--purple)', marginBottom: '10px' }}>Dependencies</p>
