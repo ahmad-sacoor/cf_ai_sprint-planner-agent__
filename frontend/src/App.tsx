@@ -150,7 +150,7 @@ function App() {
                     </AnimatePresence>
 
                     <button onClick={connectWebSocket} className="apple-button apple-button-primary" style={{ width: '100%' }}>
-                        Join Sprint
+                        Create/Join Sprint
                     </button>
                 </motion.div>
             </div>
