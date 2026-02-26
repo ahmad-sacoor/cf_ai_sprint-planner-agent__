@@ -20,6 +20,7 @@ export interface SprintState {
     generatedPlan: GeneratedPlan | null;
     chatHistory: ChatMessage[];
     connectedUsers: string[];
+    isGeneratingPlan: boolean;   // ← NEW: locks generate button for all users
     createdAt: number;
     lastUpdatedAt: number;
 }
@@ -79,6 +80,7 @@ export type ServerMessage =
     | { type: "chat_stream_chunk"; chunk: string; messageId: string }
     | { type: "chat_stream_done"; message: ChatMessage }
     | { type: "error"; message: string }
+    | { type: "notify"; message: string }                                          // ← NEW
     | { type: "user_joined"; userName: string; connectedUsers: string[] }
     | { type: "user_left"; userName: string; connectedUsers: string[] };
 

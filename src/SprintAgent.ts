@@ -21,6 +21,7 @@ export class SprintAgent extends Agent<Env, SprintState> {
         generatedPlan: null,
         chatHistory: [],
         connectedUsers: [],
+        isGeneratingPlan: false,   // ← NEW
         createdAt: Date.now(),
         lastUpdatedAt: Date.now(),
     };
@@ -71,6 +72,9 @@ export class SprintAgent extends Agent<Env, SprintState> {
                 case "generate_plan":
                     this.handleGeneratePlan(connection, data).catch((err) => {
                         console.error("[SprintAgent] handleGeneratePlan error:", err);
+                        // Make sure we always unlock on error
+                        this.setState({ ...this.state, isGeneratingPlan: false });
+                        this.broadcast(JSON.stringify({ type: "state_update", state: this.state }));
                         this.broadcast(JSON.stringify({ type: "error", message: String(err?.message ?? err) }));
                     });
                     break;
@@ -233,47 +237,70 @@ export class SprintAgent extends Agent<Env, SprintState> {
             return;
         }
 
-        const taskList = this.state.tasks
-            .map(
-                (t, i) =>
-                    `${i + 1}. [ID: ${t.id}]\n` +
-                    `   Title: ${t.title}\n` +
-                    `   Description: ${t.description || "(none)"}\n` +
-                    `   Impact: ${t.impact}/5 | Effort: ${t.effort}/5 | Priority: ${t.priority}/5\n` +
-                    `   Value Score: ${((t.impact * t.priority) / t.effort).toFixed(2)}\n` +
-                    `   Assignee: ${t.assignee}`
-            )
-            .join("\n\n");
+        // Guard: don't allow concurrent generation
+        if (this.state.isGeneratingPlan) {
+            connection.send(JSON.stringify({
+                type: "error",
+                message: "A plan is already being generated. Please wait.",
+            }));
+            return;
+        }
 
-        const constraintsSection = data.constraints
-            ? `\n\nAdditional constraints: ${data.constraints}`
-            : "";
+        // ── Lock for all users + notify ──────────────────────────────────────
+        this.setState({ ...this.state, isGeneratingPlan: true, lastUpdatedAt: Date.now() });
+        this.broadcast(JSON.stringify({ type: "state_update", state: this.state }));
+        this.broadcast(JSON.stringify({
+            type: "notify",
+            message: `${data.userName} is generating the AI plan…`,
+        }));
 
-        const systemPrompt =
-            "You are a senior engineering manager with 15 years experience running sprints.\n" +
-            "A junior dev can sort tasks by impact/effort score — that is NOT your job here.\n" +
-            "Your job is to find non-obvious insights a number-sorter would miss:\n" +
-            "- Tasks that SOUND different but solve the same underlying problem (not just identical titles)\n" +
-            "- Hidden blockers: task B will fail or be wasted if task A isn't done first\n" +
-            "- Risk flags: tasks that are underestimated based on their description\n" +
-            "- Scope creep: tasks vague enough that they could explode in effort mid-sprint\n" +
-            "- Assignee overload: if the same person is on too many high-effort tasks\n" +
-            "- Quick wins that will unblock OTHER tasks, not just high value standalone\n" +
-            "Be specific in your rationale — reference the actual task descriptions, not just the numbers.\n" +
-            "CRITICAL: Return ONLY raw JSON. No markdown, no code fences, no explanation outside the JSON.";
+        try {
+            // Deduplicate tasks by title before sending to AI
+            const uniqueTasks = this.state.tasks.filter(
+                (t, i, arr) => arr.findIndex(x => x.title.toLowerCase() === t.title.toLowerCase()) === i
+            );
 
-        const userPrompt =
-            `Sprint backlog:\n\n${taskList}${constraintsSection}\n\n` +
-            "Return ONLY this JSON (no other text):\n" +
-            `{
+            const taskList = uniqueTasks
+                .map(
+                    (t, i) =>
+                        `${i + 1}. [ID: ${t.id}]\n` +
+                        `   Title: ${t.title}\n` +
+                        `   Description: ${t.description || "(none)"}\n` +
+                        `   Impact: ${t.impact}/5 | Effort: ${t.effort}/5 | Priority: ${t.priority}/5\n` +
+                        `   Value Score: ${((t.impact * t.priority) / t.effort).toFixed(2)}\n` +
+                        `   Assignee: ${t.assignee}`
+                )
+                .join("\n\n");
+
+            const constraintsSection = data.constraints
+                ? `\n\nAdditional constraints: ${data.constraints}`
+                : "";
+
+            const systemPrompt =
+                "You are a senior engineering manager with 15 years experience running sprints.\n" +
+                "A junior dev can sort tasks by impact/effort score — that is NOT your job here.\n" +
+                "Your job is to find non-obvious insights a number-sorter would miss:\n" +
+                "- Tasks that SOUND different but solve the same underlying problem (not just identical titles)\n" +
+                "- Hidden blockers: task B will fail or be wasted if task A isn't done first\n" +
+                "- Risk flags: tasks that are underestimated based on their description\n" +
+                "- Scope creep: tasks vague enough that they could explode in effort mid-sprint\n" +
+                "- Assignee overload: if the same person is on too many high-effort tasks\n" +
+                "- Quick wins that will unblock OTHER tasks, not just high value standalone\n" +
+                "Be specific in your rationale — reference the actual task descriptions, not just the numbers.\n" +
+                "CRITICAL: Return ONLY raw JSON. No markdown, no code fences, no explanation outside the JSON.";
+
+            const userPrompt =
+                `Sprint backlog:\n\n${taskList}${constraintsSection}\n\n` +
+                "Return ONLY this JSON (no other text):\n" +
+                `{
   "prioritizedTasks":[{"taskId":"<id>","rank":1,"rationale":"<specific insight referencing description, not just numbers>","recommendation":"include|defer|split|clarify"}],
   "topRecommendations":[
-    "<actionable recommendation 1 — e.g. swap task X and Y because...>",
+    "<actionable recommendation 1>",
     "<actionable recommendation 2>",
     "<actionable recommendation 3>"
   ],
   "risks":[
-    "<specific risk with task name — e.g. Redesign dashboard is likely underestimated, UI work always expands>",
+    "<specific risk with task name>",
     "<specific risk 2>"
   ],
   "assigneeFlags":[
@@ -284,71 +311,77 @@ export class SprintAgent extends Agent<Env, SprintState> {
   "warnings":["<only non-obvious duplicates — tasks that solve the same problem even if named differently>"],
   "dependencies":[{"taskId":"<id>","dependsOn":"<id>","reason":"<why this ordering matters>"}]
 }\n\n` +
-            "Requirements: every task must appear in prioritizedTasks, rationale must reference the actual description not just scores.";
+                "Requirements: every task must appear in prioritizedTasks, rationale must reference the actual description not just scores.";
 
-        const aiResponse = await (this.env.AI.run as Function)(
-            "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-            {
-                messages: [
-                    { role: "system", content: systemPrompt },
-                    { role: "user", content: userPrompt },
-                ],
-                stream: false,
-                max_tokens: 8192,
+            const aiResponse = await (this.env.AI.run as Function)(
+                "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+                {
+                    messages: [
+                        { role: "system", content: systemPrompt },
+                        { role: "user", content: userPrompt },
+                    ],
+                    stream: false,
+                    max_tokens: 2048,
+                }
+            ) as { response: string };
+
+            const rawResponse = aiResponse.response ?? aiResponse;
+            const accumulated = (typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse)).trim();
+            console.log(`[SprintAgent] Plan raw response (${accumulated.length} chars):`, accumulated.slice(0, 300));
+
+            if (accumulated) {
+                this.broadcast(JSON.stringify({ type: "plan_stream_chunk", chunk: accumulated }));
             }
-        ) as { response: string };
 
-        const rawResponse = aiResponse.response ?? aiResponse;
-        const accumulated = (typeof rawResponse === "string" ? rawResponse : JSON.stringify(rawResponse)).trim();
-        console.log(`[SprintAgent] Plan raw response (${accumulated.length} chars):`, accumulated.slice(0, 300));
+            const sanitized = accumulated
+                .replace(/```json\n?/g, "")
+                .replace(/```\n?/g, "")
+                .trim();
 
-        if (accumulated) {
-            this.broadcast(JSON.stringify({ type: "plan_stream_chunk", chunk: accumulated }));
+            let parsedPlan: {
+                prioritizedTasks: PrioritizedTask[];
+                topRecommendations?: string[];
+                risks?: string[];
+                assigneeFlags?: string[];
+                summary: string;
+                totalEstimatedEffort: number;
+                warnings?: string[];
+                dependencies?: { taskId: string; dependsOn: string; reason: string }[];
+            };
+
+            try {
+                parsedPlan = JSON.parse(sanitized);
+            } catch (parseErr) {
+                console.error("[SprintAgent] JSON parse failed:", parseErr, "\nFull raw:\n", sanitized);
+                this.broadcast(JSON.stringify({
+                    type: "error",
+                    message: "AI returned invalid JSON. Full response logged to server console.",
+                }));
+                return;
+            }
+
+            const plan: GeneratedPlan = {
+                prioritizedTasks: parsedPlan.prioritizedTasks,
+                topRecommendations: parsedPlan.topRecommendations ?? [],
+                risks: parsedPlan.risks ?? [],
+                assigneeFlags: parsedPlan.assigneeFlags ?? [],
+                summary: parsedPlan.summary,
+                totalEstimatedEffort: parsedPlan.totalEstimatedEffort,
+                warnings: parsedPlan.warnings ?? [],
+                dependencies: parsedPlan.dependencies ?? [],
+                generatedAt: Date.now(),
+                generatedBy: data.userName,
+            };
+
+            this.setState({ ...this.state, generatedPlan: plan, lastUpdatedAt: Date.now() });
+            this.broadcast(JSON.stringify({ type: "plan_stream_done", plan }));
+            this.broadcast(JSON.stringify({ type: "state_update", state: this.state }));
+
+        } finally {
+            // ── Always unlock, even if AI call throws ────────────────────────
+            this.setState({ ...this.state, isGeneratingPlan: false, lastUpdatedAt: Date.now() });
+            this.broadcast(JSON.stringify({ type: "state_update", state: this.state }));
         }
-
-        const sanitized = accumulated
-            .replace(/```json\n?/g, "")
-            .replace(/```\n?/g, "")
-            .trim();
-
-        let parsedPlan: {
-            prioritizedTasks: PrioritizedTask[];
-            topRecommendations?: string[];
-            risks?: string[];
-            assigneeFlags?: string[];
-            summary: string;
-            totalEstimatedEffort: number;
-            warnings?: string[];
-            dependencies?: { taskId: string; dependsOn: string; reason: string }[];
-        };
-
-        try {
-            parsedPlan = JSON.parse(sanitized);
-        } catch (parseErr) {
-            console.error("[SprintAgent] JSON parse failed:", parseErr, "\nFull raw:\n", sanitized);
-            this.broadcast(JSON.stringify({
-                type: "error",
-                message: "AI returned invalid JSON. Full response logged to server console.",
-            }));
-            return;
-        }
-
-        const plan: GeneratedPlan = {
-            prioritizedTasks: parsedPlan.prioritizedTasks,
-            topRecommendations: parsedPlan.topRecommendations ?? [],
-            risks: parsedPlan.risks ?? [],
-            assigneeFlags: parsedPlan.assigneeFlags ?? [],
-            summary: parsedPlan.summary,
-            totalEstimatedEffort: parsedPlan.totalEstimatedEffort,
-            warnings: parsedPlan.warnings ?? [],
-            dependencies: parsedPlan.dependencies ?? [],
-            generatedAt: Date.now(),
-            generatedBy: data.userName,
-        };
-
-        this.setState({ ...this.state, generatedPlan: plan, lastUpdatedAt: Date.now() });
-        this.broadcast(JSON.stringify({ type: "plan_stream_done", plan }));
-        this.broadcast(JSON.stringify({ type: "state_update", state: this.state }));
     }
 
     // ─── Chat ─────────────────────────────────────────────────────────────────
